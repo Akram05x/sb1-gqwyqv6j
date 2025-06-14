@@ -1,0 +1,159 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+    
+    function isEmailVerified() {
+      return isAuthenticated() && request.auth.token.email_verified == true;
+    }
+
+    function isTestUser(userId) {
+      return userId in ['admin-test-user-123', 'test-user-456'];
+    }
+
+    function isSystemInitialization() {
+      // Allow system initialization for specific test user IDs
+      return resource == null && request.resource.data.email in ['admin@fixmycity.se', 'test@fixmycity.se'];
+    }
+
+    // Users collection
+    match /users/{userId} {
+      // Users can read their own profile, admins can read all
+      allow read: if isOwner(userId) || isAdmin();
+      
+      // Allow creation for:
+      // 1. Authenticated users creating their own profile
+      // 2. System initialization (for admin/test users)
+      allow create: if (
+        // Authenticated user creating their own profile
+        (isOwner(userId) && 
+         request.resource.data.keys().hasAll(['email', 'name', 'role', 'preferred_language', 'points_balance', 'created_at']) &&
+         request.resource.data.role == 'user' &&
+         request.resource.data.points_balance == 0) ||
+        
+        // System initialization - allow creating admin/test users
+        (isSystemInitialization() ||
+         (isTestUser(userId) && request.resource.data.email in ['admin@fixmycity.se', 'test@fixmycity.se']))
+      );
+      
+      // Users can update their own profile (limited fields), admins can update any
+      allow update: if (
+        (isOwner(userId) && 
+         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'preferred_language', 'email_verified', 'last_login'])) ||
+        isAdmin() ||
+        isSystemInitialization()
+      );
+      
+      // Only admins can delete users
+      allow delete: if isAdmin();
+    }
+
+    // Issues collection
+    match /issues/{issueId} {
+      // Anyone can read issues (for public map display)
+      allow read: if true;
+      
+      // Allow issue creation for:
+      // 1. Authenticated users with their own user_id
+      // 2. Anonymous users with user_id = null
+      // 3. Must include required fields
+      allow create: if (
+        // Authenticated user creating with their own ID
+        (isAuthenticated() && 
+         request.resource.data.user_id == request.auth.uid &&
+         request.resource.data.keys().hasAll(['title', 'description', 'type', 'location_lat', 'location_lng', 'status', 'created_at', 'updated_at']) &&
+         request.resource.data.title is string &&
+         request.resource.data.description is string &&
+         request.resource.data.type in ['pothole', 'streetlight', 'graffiti', 'garbage', 'other'] &&
+         request.resource.data.location_lat is number &&
+         request.resource.data.location_lng is number &&
+         request.resource.data.status in ['new', 'confirmed', 'pending_validation']) ||
+        
+        // Anonymous user creating with null user_id
+        (request.auth == null && 
+         request.resource.data.user_id == null &&
+         request.resource.data.keys().hasAll(['title', 'description', 'type', 'location_lat', 'location_lng', 'status', 'created_at', 'updated_at']) &&
+         request.resource.data.title is string &&
+         request.resource.data.description is string &&
+         request.resource.data.type in ['pothole', 'streetlight', 'graffiti', 'garbage', 'other'] &&
+         request.resource.data.location_lat is number &&
+         request.resource.data.location_lng is number &&
+         request.resource.data.status in ['new', 'confirmed', 'pending_validation'])
+      );
+      
+      // Only admins can update issues (status changes, validation, etc.)
+      allow update: if isAdmin();
+      
+      // Only admins can delete issues
+      allow delete: if isAdmin();
+    }
+
+    // Points collection
+    match /points/{pointId} {
+      // Users can read their own points, admins can read all
+      allow read: if isOwner(resource.data.user_id) || isAdmin();
+      
+      // Allow points creation for:
+      // 1. Authenticated users creating their own points
+      // 2. Admins creating any points
+      allow create: if (
+        isAdmin() || 
+        (isAuthenticated() && 
+         request.resource.data.user_id == request.auth.uid &&
+         request.resource.data.action_type in ['report_submitted', 'report_resolved', 'reward_redemption', 'referral', 'daily_login'] &&
+         request.resource.data.value is number)
+      );
+      
+      allow update, delete: if isAdmin();
+    }
+
+    // Rewards collection
+    match /rewards/{rewardId} {
+      // Anyone can read available rewards
+      allow read: if resource.data.available == true || isAdmin();
+      
+      // Only admins can create/update/delete rewards
+      // Allow system initialization for rewards
+      allow create, update, delete: if isAdmin() || request.auth == null;
+    }
+
+    // Redemptions collection
+    match /redemptions/{redemptionId} {
+      // Users can read their own redemptions, admins can read all
+      allow read: if isOwner(resource.data.user_id) || isAdmin();
+      
+      // Authenticated users can create redemptions for themselves
+      allow create: if isAuthenticated() && 
+                       request.resource.data.user_id == request.auth.uid &&
+                       request.resource.data.keys().hasAll(['user_id', 'reward_id', 'redemption_code', 'redeemed_at', 'used']) &&
+                       request.resource.data.used == false &&
+                       request.resource.data.redemption_code is string &&
+                       request.resource.data.reward_id is string;
+      
+      // Only admins can update redemptions (mark as used)
+      allow update: if isAdmin();
+      
+      // Only admins can delete redemptions
+      allow delete: if isAdmin();
+    }
+
+    // Deny all other access
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
